@@ -1,0 +1,5 @@
+# на deploy-vm эти коллекции уже есть в пакете ansible из Ubuntu 24.04
+# (community.docker 3.7, community.postgresql 3.3)
+collections:
+  - name: community.docker
+  - name: community.postgresql

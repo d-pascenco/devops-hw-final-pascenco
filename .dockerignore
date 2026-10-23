@@ -1,0 +1,17 @@
+# в контекст сборки только код сервиса: деплой, мониторинг, CI и отчёт в образ не нужны
+# (иначе смена пароля в deploy/ давала бы другой контекст)
+.git
+.venv
+.cache
+.pytest_cache
+**/__pycache__
+dist
+deploy
+monitoring
+screenshots
+*.md
+!README.md
+.gitlab-ci.yml
+Dockerfile
+.dockerignore
+python.junit.xml

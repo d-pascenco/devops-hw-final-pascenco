@@ -1,0 +1,7 @@
+{{ ansible_managed | comment }}
+database:
+  host: {{ postgres__container }}
+  port: 5432
+  name: {{ audit_svc__db_name }}
+  user: {{ audit_svc__db_user }}
+  password: {{ audit_svc__db_password | to_json }}

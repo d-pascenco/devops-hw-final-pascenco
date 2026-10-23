@@ -1,0 +1,100 @@
+# Пайплайн audit-svc
+#  - ветка main: тесты -> сборка и публикация образа main_<short sha>
+#  - защищённый тег vX.Y.Z: тесты -> образ vX.Y.Z -> развёртывание на deploy-vm
+# шаблоны demo/templates не использую: там деплой через counter-deploy,
+# а kaniko с кэшем может затянуть старый слой после COPY --from
+
+stages:
+  - test
+  - publish
+  - deploy
+
+variables:
+  HARBOR_HOST: harbor.localtest.me:8443
+  HARBOR_IMAGE: $HARBOR_HOST/demo/$CI_PROJECT_NAME
+  PYTHON_IMAGE: python:3.11-slim-bookworm
+  KANIKO_IMAGE: gcr.io/kaniko-project/executor:v1.23.2-debug
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        IMAGE_TAG: ${CI_DEFAULT_BRANCH}_${CI_COMMIT_SHORT_SHA}
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+      variables:
+        IMAGE_TAG: $CI_COMMIT_TAG
+
+default:
+  before_script:
+    - set -eu
+
+Run Tests:
+  stage: test
+  image:
+    name: $PYTHON_IMAGE
+    entrypoint: [""]
+  cache:
+    key:
+      prefix: poetry-venv
+      files: [poetry.lock]
+    paths: [.cache/pip, .venv]
+  script:
+    - pip install --quiet "poetry==2.5.1"
+    - poetry install --no-interaction
+    - poetry run pytest --junitxml python.junit.xml
+  artifacts:
+    when: always
+    paths: [python.junit.xml]
+    reports:
+      junit: python.junit.xml
+
+Publish Image:
+  stage: publish
+  needs: [Run Tests]
+  interruptible: false
+  image:
+    name: $KANIKO_IMAGE
+    entrypoint: [""]
+  script:
+    # логин в Harbor: переменные робота заведены на уровне группы (секрет masked, в лог не попадает)
+    - b64_auth=$(printf '%s:%s' "$HARBOR_ROBOT_USER" "$HARBOR_ROBOT_SECRET" | base64 | tr -d '\n')
+    # через >-: экранирование двоеточия в JSON-строке для парсера YAML
+    - >-
+      printf '{"auths": {"%s": {"auth": "%s"}}}' "$HARBOR_HOST" "$b64_auth" >/kaniko/.docker/config.json
+    # сборка без кэша и с --reproducible: одинаковый digest для одного и того же кода
+    - >-
+      /kaniko/executor
+      --reproducible
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+      --destination "$HARBOR_IMAGE:$IMAGE_TAG"
+      --digest-file image.digest
+    - echo "pushed $HARBOR_IMAGE:$IMAGE_TAG@$(cat image.digest)"
+  artifacts:
+    paths: [image.digest]
+
+Deploy:
+  stage: deploy
+  needs: [Publish Image]
+  # задача выполняется shell-раннером на deploy-vm
+  tags: [deploy]
+  interruptible: false
+  resource_group: prom
+  environment:
+    name: prom
+    url: http://localhost:8088
+  variables:
+    ANSIBLE_FORCE_COLOR: "false"
+  script:
+    - printf '%s' "$HARBOR_ROBOT_SECRET" | docker login --username "$HARBOR_ROBOT_USER" --password-stdin "$HARBOR_HOST"
+    - cd deploy
+    # пароль от vault берётся из защищённой CI-переменной ANSIBLE_VAULT_PASSWORD скриптом vault-pass.sh
+    - >-
+      ansible-playbook audit-svc.play.yml
+      --vault-password-file ./vault-pass.sh
+      --extra-vars "audit_svc__image=$HARBOR_IMAGE:$IMAGE_TAG"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/

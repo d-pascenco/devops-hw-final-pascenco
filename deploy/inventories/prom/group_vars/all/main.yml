@@ -1,0 +1,21 @@
+# образ сервиса передаётся из CI: --extra-vars audit_svc__image=harbor.../audit-svc:vX.Y.Z
+audit_svc__container: audit-svc
+audit_svc__network: audit
+audit_svc__data_dir: /data/audit-svc
+audit_svc__db_name: audit
+audit_svc__db_user: audit_svc
+audit_svc__db_password: "{{ vault_audit_svc_db_password }}"
+
+postgres__container: audit-postgres
+postgres__image: postgres:17
+postgres__volume: audit-postgres-data
+postgres__superuser_password: "{{ vault_postgres_superuser_password }}"
+
+nginx__container: audit-nginx
+nginx__image: nginx:1.28-alpine
+nginx__port: 8080          # deploy-vm:8080 проброшен на хост как localhost:8088
+nginx__status_port: 8081   # stub_status, наружу не публикуется
+
+nginx_exporter__container: audit-nginx-exporter
+nginx_exporter__image: nginx/nginx-prometheus-exporter:1.4
+nginx_exporter__port: 9113

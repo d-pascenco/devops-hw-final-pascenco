@@ -1,0 +1,202 @@
+- name: Deploy audit-svc
+  hosts: prom
+
+  handlers:
+    # перечитывание конфига сервисом без перезапуска контейнера
+    - name: Get audit-svc address
+      community.docker.docker_container_info:
+        name: "{{ audit_svc__container }}"
+      register: __svc_info
+      listen: Reload audit-svc config
+
+    # /reload закрыт на nginx, поэтому ходим напрямую на IP контейнера в docker-сети
+    - name: POST /reload
+      ansible.builtin.uri:
+        url: "http://{{ __svc_info.container.NetworkSettings.Networks[audit_svc__network].IPAddress }}:8080/reload"
+        method: POST
+        return_content: true
+      register: __reload
+      # при первом развёртывании контейнер только что стартовал и может ещё не слушать порт
+      until: __reload.status == 200
+      retries: 10
+      delay: 2
+      changed_when: true
+      listen: Reload audit-svc config
+
+    - name: Show /reload response
+      ansible.builtin.debug:
+        var: __reload.json
+      listen: Reload audit-svc config
+
+    - name: Reload nginx
+      community.docker.docker_container_exec:
+        container: "{{ nginx__container }}"
+        command: nginx -s reload
+
+  tasks:
+    - name: Check that image is set
+      ansible.builtin.assert:
+        that: audit_svc__image is defined and audit_svc__image | length > 0
+        fail_msg: "передайте образ: --extra-vars audit_svc__image=..."
+
+    - name: Create docker network
+      community.docker.docker_network:
+        name: "{{ audit_svc__network }}"
+
+    - name: Create postgres volume
+      community.docker.docker_volume:
+        name: "{{ postgres__volume }}"
+
+    - name: Create config directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ audit_svc__data_dir }}/config"
+        - "{{ audit_svc__data_dir }}/nginx"
+
+    - name: Start PostgreSQL
+      community.docker.docker_container:
+        name: "{{ postgres__container }}"
+        image: "{{ postgres__image }}"
+        env:
+          POSTGRES_PASSWORD: "{{ postgres__superuser_password }}"
+        volumes:
+          - "{{ postgres__volume }}:/var/lib/postgresql/data"
+        networks:
+          - name: "{{ audit_svc__network }}"
+        healthcheck:
+          test: ["CMD", "pg_isready", "-U", "postgres"]
+          interval: 5s
+          retries: 10
+        restart_policy: unless-stopped
+      no_log: true
+
+    - name: Wait for PostgreSQL to become healthy
+      community.docker.docker_container_info:
+        name: "{{ postgres__container }}"
+      register: __pg_info
+      until: __pg_info.container.State.Health.Status == "healthy"
+      retries: 30
+      delay: 2
+
+    # берём IP контейнера postgres в docker-сети
+    - name: Remember PostgreSQL address
+      ansible.builtin.set_fact:
+        __pg_host: "{{ __pg_info.container.NetworkSettings.Networks[audit_svc__network].IPAddress }}"
+
+    - name: Create database user
+      community.postgresql.postgresql_user:
+        name: "{{ audit_svc__db_user }}"
+        password: "{{ audit_svc__db_password }}"
+        login_host: "{{ __pg_host }}"
+        login_user: postgres
+        login_password: "{{ postgres__superuser_password }}"
+      no_log: true
+
+    - name: Create database
+      community.postgresql.postgresql_db:
+        name: "{{ audit_svc__db_name }}"
+        owner: "{{ audit_svc__db_user }}"
+        login_host: "{{ __pg_host }}"
+        login_user: postgres
+        login_password: "{{ postgres__superuser_password }}"
+
+    # права 0640, в контейнер монтируем саму папку config (чтобы при перезаписи шаблоном файл обновлялся)
+    - name: Render audit-svc config
+      ansible.builtin.template:
+        src: config.yaml.j2
+        dest: "{{ audit_svc__data_dir }}/config/config.yaml"
+        mode: "0640"
+      notify: Reload audit-svc config
+
+    - name: Pull audit-svc image
+      community.docker.docker_image:
+        name: "{{ audit_svc__image }}"
+        source: pull
+
+    # прогоняем миграции перед запуском/обновлением сервиса
+    - name: Run database migrations
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --network={{ audit_svc__network }}
+          - --volume={{ audit_svc__data_dir }}/config:/etc/audit-svc:ro
+          - --group-add={{ ansible_facts.user_gid }}
+          - "{{ audit_svc__image }}"
+          - migrate
+      register: __migrate
+      changed_when: "'done: 0 applied' not in __migrate.stderr"
+
+    - name: Show migration log
+      ansible.builtin.debug:
+        var: __migrate.stderr_lines
+
+    - name: Start audit-svc
+      community.docker.docker_container:
+        name: "{{ audit_svc__container }}"
+        image: "{{ audit_svc__image }}"
+        # если у нового тега тот же digest - контейнер не пересоздаём
+        image_name_mismatch: ignore
+        groups:
+          - "{{ ansible_facts.user_gid | string }}"
+        volumes:
+          - "{{ audit_svc__data_dir }}/config:/etc/audit-svc:ro"
+        networks:
+          - name: "{{ audit_svc__network }}"
+        restart_policy: unless-stopped
+
+    - name: Render nginx config
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: "{{ audit_svc__data_dir }}/nginx/default.conf"
+        mode: "0640"
+      notify: Reload nginx
+
+    - name: Start nginx
+      community.docker.docker_container:
+        name: "{{ nginx__container }}"
+        image: "{{ nginx__image }}"
+        volumes:
+          - "{{ audit_svc__data_dir }}/nginx:/etc/nginx/conf.d:ro"
+        networks:
+          - name: "{{ audit_svc__network }}"
+        published_ports:
+          - "{{ nginx__port }}:{{ nginx__port }}"
+        restart_policy: unless-stopped
+
+    - name: Start nginx-exporter
+      community.docker.docker_container:
+        name: "{{ nginx_exporter__container }}"
+        image: "{{ nginx_exporter__image }}"
+        command:
+          - --nginx.scrape-uri=http://{{ nginx__container }}:{{ nginx__status_port }}/stub_status
+        networks:
+          - name: "{{ audit_svc__network }}"
+        published_ports:
+          - "{{ nginx_exporter__port }}:9113"
+        restart_policy: unless-stopped
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check /healthz through nginx
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ nginx__port }}/healthz"
+      register: __health
+      until: __health.status == 200
+      retries: 10
+      delay: 3
+
+    - name: Check nginx-exporter
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ nginx_exporter__port }}/metrics"
+        return_content: true
+      register: __exporter
+      until: "'nginx_up 1' in __exporter.content"
+      retries: 10
+      delay: 3
+      no_log: true
